@@ -1,4 +1,6 @@
 const connectBtn = document.getElementById("connectBtn");
+const startVizBtn = document.getElementById("startVizBtn");
+const stopVizBtn = document.getElementById("stopVizBtn");
 const statusEl = document.getElementById("status");
 const canvas = document.getElementById("chart");
 const ctx = canvas.getContext("2d");
@@ -13,11 +15,14 @@ let serialReader;
 let lineBuffer = "";
 let activeTransport = null;
 let mvcReferenceMv = parseFloat(mvcInput.value) || 100;
+let vizRunning = true;
 
 const UART_SERVICE_UUID = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
 const UART_NOTIFY_UUID = "6e400003-b5a3-f393-e0a9-e50e24dcca9e";
 
-const MAX_POINTS = 300;
+const WINDOW_SECONDS = 30;
+const MIN_POINTS = 300;
+const MAX_POINTS = 4000;
 const RMS_WINDOW_SECONDS = 0.1;
 const HP_ALPHA = 0.95;
 const LP_ALPHA = 0.2;
@@ -50,32 +55,44 @@ function updateMvcLabel() {
   mvcLabel.textContent = `Current MVC: ${mvcReferenceMv.toFixed(1)} mV`;
 }
 
+function getWindowPoints() {
+  const points = Math.round((WINDOW_SECONDS * 1000) / estimatedDtMs);
+  return Math.max(MIN_POINTS, Math.min(MAX_POINTS, points));
+}
+
+function trimToWindow(arr) {
+  const target = getWindowPoints();
+  while (arr.length > target) arr.shift();
+}
+
 applyMvcBtn?.addEventListener("click", () => {
   const value = parseFloat(mvcInput.value);
   if (!Number.isFinite(value) || value <= 0) {
-    setStatus("MVC must be a positive number in mV.", true);
-    return;
+    return setStatus("MVC must be > 0 mV.", true);
   }
-
   mvcReferenceMv = value;
   updateMvcLabel();
   setStatus(`MVC updated to ${mvcReferenceMv.toFixed(1)} mV.`);
 });
 
-function resetBuffer() {
-  lineBuffer = "";
-}
+startVizBtn?.addEventListener("click", () => {
+  vizRunning = true;
+  setStatus("Visualization running.");
+});
+
+stopVizBtn?.addEventListener("click", () => {
+  vizRunning = false;
+  setStatus("Visualization paused. Data still streaming.");
+});
 
 connectBtn?.addEventListener("click", async () => {
   try {
     await connectBluetooth();
   } catch (bleErr) {
-    console.warn("BLE failed, trying Serial...", bleErr);
     setStatus(`BLE failed: ${bleErr.message}. Trying Serial...`, true);
     try {
       await connectSerial();
     } catch (serialErr) {
-      console.error(serialErr);
       setStatus(`Serial failed: ${serialErr.message}`, true);
     }
   }
@@ -83,18 +100,18 @@ connectBtn?.addEventListener("click", async () => {
 
 async function connectBluetooth() {
   if (!navigator.bluetooth) throw new Error("Web Bluetooth unavailable.");
-  setStatus("Opening Bluetooth device picker...");
+
   bleDevice = await navigator.bluetooth.requestDevice({
     acceptAllDevices: true,
-    optionalServices: [UART_SERVICE_UUID, "battery_service", "device_information"]
+    optionalServices: [UART_SERVICE_UUID]
   });
-  bleDevice.addEventListener("gattserverdisconnected", () =>
-    setStatus("BLE disconnected.", true)
-  );
+
   const server = await bleDevice.gatt.connect();
   bleNotifyCharacteristic = await findBleNotifyCharacteristic(server);
+
   await bleNotifyCharacteristic.startNotifications();
   bleNotifyCharacteristic.addEventListener("characteristicvaluechanged", handleBleData);
+
   activeTransport = "ble";
   setStatus(`BLE connected to ${bleDevice.name || "device"}.`);
 }
@@ -107,11 +124,8 @@ async function findBleNotifyCharacteristic(server) {
 
   const services = await server.getPrimaryServices();
   for (const service of services) {
-    const characteristics = await service.getCharacteristics();
-    for (const characteristic of characteristics) {
-      if (characteristic.properties.notify || characteristic.properties.indicate) {
-        return characteristic;
-      }
+    for (const ch of await service.getCharacteristics()) {
+      if (ch.properties.notify || ch.properties.indicate) return ch;
     }
   }
 
@@ -119,16 +133,17 @@ async function findBleNotifyCharacteristic(server) {
 }
 
 function handleBleData(event) {
-  const decoder = new TextDecoder();
-  lineBuffer += decoder.decode(event.target.value, { stream: true });
+  lineBuffer += new TextDecoder().decode(event.target.value, { stream: true });
   processBufferedLines();
 }
 
 async function connectSerial() {
   if (!navigator.serial) throw new Error("Web Serial unavailable.");
+
   serialPort = await navigator.serial.requestPort();
   await serialPort.open({ baudRate: 115200 });
   serialReader = serialPort.readable.getReader();
+
   activeTransport = "serial";
   setStatus("Serial connected (115200 baud). Streaming...");
   readSerialLoop();
@@ -136,10 +151,12 @@ async function connectSerial() {
 
 async function readSerialLoop() {
   const decoder = new TextDecoder();
+
   while (activeTransport === "serial" && serialReader) {
     const { value, done } = await serialReader.read();
     if (done) break;
     if (!value) continue;
+
     lineBuffer += decoder.decode(value, { stream: true });
     processBufferedLines();
   }
@@ -181,7 +198,7 @@ function processSample(vals) {
     const ch = sensors[i];
 
     ch.raw.push(rawMv);
-    if (ch.raw.length > MAX_POINTS) ch.raw.shift();
+    trimToWindow(ch.raw);
 
     const hp = HP_ALPHA * (ch.hpState + rawMv - ch.prevInput);
     ch.hpState = hp;
@@ -191,37 +208,43 @@ function processSample(vals) {
     ch.lpState = bandpass;
 
     ch.bandpass.push(bandpass);
-    if (ch.bandpass.length > MAX_POINTS) ch.bandpass.shift();
+    trimToWindow(ch.bandpass);
 
     const rectified = Math.abs(bandpass);
     ch.rectified.push(rectified);
-    if (ch.rectified.length > MAX_POINTS) ch.rectified.shift();
+    trimToWindow(ch.rectified);
 
     const recentRect = ch.rectified.slice(-rmsWindowSamples);
-    const meanSquare = recentRect.reduce((sum, v) => sum + v * v, 0) / recentRect.length;
-    const rms = Math.sqrt(meanSquare);
+    const rms = Math.sqrt(
+      recentRect.reduce((sum, v) => sum + v * v, 0) / recentRect.length
+    );
 
     ch.smoothed.push(rms);
-    if (ch.smoothed.length > MAX_POINTS) ch.smoothed.shift();
+    trimToWindow(ch.smoothed);
 
     const normalized = (rms / mvcReferenceMv) * 100;
     ch.normalized.push(normalized);
-    if (ch.normalized.length > MAX_POINTS) ch.normalized.shift();
+    trimToWindow(ch.normalized);
   });
 
-  draw();
+  if (vizRunning) draw();
 }
 
 function draw() {
   ctx.clearRect(0, 0, canvas.width, canvas.height);
 
-  drawSection("Raw EMG (Bandpass, mV)", sensors.map((c) => c.bandpass), 0, 220, true);
+  drawSection(
+    `Raw EMG (Bandpass, mV) - ${WINDOW_SECONDS}s rolling window`,
+    sensors.map((c) => c.bandpass),
+    0,
+    220,
+    true
+  );
   drawSection(
     "Rectified + RMS Smoothed (mV)",
     sensors.map((c) => c.smoothed),
     240,
-    220,
-    false
+    220
   );
   drawSection(
     "Normalized EMG (%MVC)",
@@ -269,30 +292,31 @@ function drawSection(
     yMax += 1;
   }
 
-  drawYAxisLabels(yMin, yMax, left, top + 25, bottom, forcedMax !== null ? "%MVC" : "mV");
+  const unit = forcedMax !== null ? "%MVC" : "mV";
+  ctx.fillStyle = "#334155";
+  ctx.font = "11px Arial";
+  ctx.fillText(`${yMax.toFixed(1)} ${unit}`, 8, top + 35);
+  ctx.fillText(`${((yMax + yMin) / 2).toFixed(1)} ${unit}`, 8, (top + bottom) / 2);
+  ctx.fillText(`${yMin.toFixed(1)} ${unit}`, 8, bottom);
 
   const colors = ["#d62828", "#1d4ed8", "#2b9348"];
+  const points = getWindowPoints();
   channelData.forEach((data, idx) =>
-    drawLineInBox(data, colors[idx], left, right, top + 25, bottom, yMin, yMax)
+    drawLineInBox(data, colors[idx], left, right, top + 25, bottom, yMin, yMax, points)
   );
 }
 
-function drawYAxisLabels(yMin, yMax, x, top, bottom, unit) {
-  ctx.fillStyle = "#334155";
-  ctx.font = "11px Arial";
-  ctx.fillText(`${yMax.toFixed(1)} ${unit}`, 8, top + 10);
-  ctx.fillText(`${((yMax + yMin) / 2).toFixed(1)} ${unit}`, 8, (top + bottom) / 2);
-  ctx.fillText(`${yMin.toFixed(1)} ${unit}`, 8, bottom);
-}
-
-function drawLineInBox(data, color, left, right, top, bottom, yMin, yMax) {
+function drawLineInBox(data, color, left, right, top, bottom, yMin, yMax, points) {
   if (!data.length) return;
+
+  const start = Math.max(0, data.length - points);
+  const visible = data.slice(start);
+
   ctx.beginPath();
   ctx.strokeStyle = color;
-  data.forEach((v, i) => {
-    const x = left + (i / (MAX_POINTS - 1)) * (right - left);
-    const yNorm = (v - yMin) / (yMax - yMin);
-    const y = bottom - yNorm * (bottom - top);
+  visible.forEach((v, i) => {
+    const x = left + (i / Math.max(1, visible.length - 1)) * (right - left);
+    const y = bottom - ((v - yMin) / (yMax - yMin)) * (bottom - top);
     if (i === 0) ctx.moveTo(x, y);
     else ctx.lineTo(x, y);
   });
@@ -300,3 +324,4 @@ function drawLineInBox(data, color, left, right, top, bottom, yMin, yMax) {
 }
 
 updateMvcLabel();
+draw();

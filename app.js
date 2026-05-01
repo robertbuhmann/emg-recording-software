@@ -4,37 +4,34 @@ const stopVizBtn = document.getElementById("stopVizBtn");
 const statusEl = document.getElementById("status");
 const canvas = document.getElementById("chart");
 const ctx = canvas.getContext("2d");
-const mvcInput = document.getElementById("mvcInput");
-const applyMvcBtn = document.getElementById("applyMvcBtn");
-const mvcLabel = document.getElementById("mvcLabel");
+const mvcInputs = [
+  document.getElementById("mvcInput1"),
+  document.getElementById("mvcInput2")
+];
+const maxRmsEls = [
+  document.getElementById("maxRms1"),
+  document.getElementById("maxRms2")
+];
 
-let bleDevice;
-let bleNotifyCharacteristic;
+let lineBuffer = "";
 let serialPort;
 let serialReader;
-let lineBuffer = "";
-let activeTransport = null;
-let mvcReferenceMv = parseFloat(mvcInput.value) || 100;
 let vizRunning = true;
-
-const UART_SERVICE_UUID = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
-const UART_NOTIFY_UUID = "6e400003-b5a3-f393-e0a9-e50e24dcca9e";
+let estimatedDtMs = 10;
+let lastSampleTime = null;
 
 const WINDOW_SECONDS = 30;
+const RMS_WINDOW_SECONDS = 0.1;
 const MIN_POINTS = 300;
 const MAX_POINTS = 4000;
-const RMS_WINDOW_SECONDS = 0.1;
 const HP_ALPHA = 0.95;
 const LP_ALPHA = 0.2;
 
-let lastSampleTime = null;
-let estimatedDtMs = 10;
+let mvcReferenceMv = mvcInputs.map((i) => parseFloat(i.value) || 100);
+let sensors = [createSensor(), createSensor()];
 
-let sensors = [createChannel(), createChannel(), createChannel()];
-
-function createChannel() {
+function createSensor() {
   return {
-    raw: [],
     bandpass: [],
     rectified: [],
     smoothed: [],
@@ -46,13 +43,8 @@ function createChannel() {
 }
 
 function setStatus(message, isError = false) {
-  if (!statusEl) return;
   statusEl.textContent = message;
   statusEl.classList.toggle("error", isError);
-}
-
-function updateMvcLabel() {
-  mvcLabel.textContent = `Current MVC: ${mvcReferenceMv.toFixed(1)} mV`;
 }
 
 function getWindowPoints() {
@@ -60,103 +52,50 @@ function getWindowPoints() {
   return Math.max(MIN_POINTS, Math.min(MAX_POINTS, points));
 }
 
-function trimToWindow(arr) {
-  const target = getWindowPoints();
-  while (arr.length > target) arr.shift();
+function trim(arr) {
+  const n = getWindowPoints();
+  while (arr.length > n) arr.shift();
 }
 
-applyMvcBtn?.addEventListener("click", () => {
-  const value = parseFloat(mvcInput.value);
-  if (!Number.isFinite(value) || value <= 0) {
-    return setStatus("MVC must be > 0 mV.", true);
-  }
-  mvcReferenceMv = value;
-  updateMvcLabel();
-  setStatus(`MVC updated to ${mvcReferenceMv.toFixed(1)} mV.`);
+mvcInputs.forEach((input, idx) => {
+  input.addEventListener("change", () => {
+    const v = parseFloat(input.value);
+    if (Number.isFinite(v) && v > 0) mvcReferenceMv[idx] = v;
+  });
 });
 
-startVizBtn?.addEventListener("click", () => {
+startVizBtn.addEventListener("click", () => {
   vizRunning = true;
   setStatus("Visualization running.");
+  draw();
 });
 
-stopVizBtn?.addEventListener("click", () => {
+stopVizBtn.addEventListener("click", () => {
   vizRunning = false;
   setStatus("Visualization paused. Data still streaming.");
 });
 
-connectBtn?.addEventListener("click", async () => {
-  try {
-    await connectBluetooth();
-  } catch (bleErr) {
-    setStatus(`BLE failed: ${bleErr.message}. Trying Serial...`, true);
-    try {
-      await connectSerial();
-    } catch (serialErr) {
-      setStatus(`Serial failed: ${serialErr.message}`, true);
-    }
-  }
-});
-
-async function connectBluetooth() {
-  if (!navigator.bluetooth) throw new Error("Web Bluetooth unavailable.");
-
-  bleDevice = await navigator.bluetooth.requestDevice({
-    acceptAllDevices: true,
-    optionalServices: [UART_SERVICE_UUID]
-  });
-
-  const server = await bleDevice.gatt.connect();
-  bleNotifyCharacteristic = await findBleNotifyCharacteristic(server);
-
-  await bleNotifyCharacteristic.startNotifications();
-  bleNotifyCharacteristic.addEventListener("characteristicvaluechanged", handleBleData);
-
-  activeTransport = "ble";
-  setStatus(`BLE connected to ${bleDevice.name || "device"}.`);
-}
-
-async function findBleNotifyCharacteristic(server) {
-  try {
-    const service = await server.getPrimaryService(UART_SERVICE_UUID);
-    return await service.getCharacteristic(UART_NOTIFY_UUID);
-  } catch (_) {}
-
-  const services = await server.getPrimaryServices();
-  for (const service of services) {
-    for (const ch of await service.getCharacteristics()) {
-      if (ch.properties.notify || ch.properties.indicate) return ch;
-    }
-  }
-
-  throw new Error("No notify/indicate characteristic found.");
-}
-
-function handleBleData(event) {
-  lineBuffer += new TextDecoder().decode(event.target.value, { stream: true });
-  processBufferedLines();
-}
+connectBtn.addEventListener("click", connectSerial);
 
 async function connectSerial() {
-  if (!navigator.serial) throw new Error("Web Serial unavailable.");
-
-  serialPort = await navigator.serial.requestPort();
-  await serialPort.open({ baudRate: 115200 });
-  serialReader = serialPort.readable.getReader();
-
-  activeTransport = "serial";
-  setStatus("Serial connected (115200 baud). Streaming...");
-  readSerialLoop();
+  try {
+    if (!navigator.serial) throw new Error("Web Serial unavailable.");
+    serialPort = await navigator.serial.requestPort();
+    await serialPort.open({ baudRate: 115200 });
+    serialReader = serialPort.readable.getReader();
+    setStatus("Serial connected (115200). Streaming...");
+    readSerialLoop();
+  } catch (err) {
+    setStatus(`Serial failed: ${err.message}`, true);
+  }
 }
 
 async function readSerialLoop() {
   const decoder = new TextDecoder();
-
-  while (activeTransport === "serial" && serialReader) {
+  while (serialReader) {
     const { value, done } = await serialReader.read();
     if (done) break;
     if (!value) continue;
-
     lineBuffer += decoder.decode(value, { stream: true });
     processBufferedLines();
   }
@@ -166,19 +105,16 @@ function processBufferedLines() {
   const lines = lineBuffer.split(/\r?\n/);
   lineBuffer = lines.pop() || "";
 
-  for (const rawLine of lines) {
-    const line = rawLine.trim();
-    if (!line) continue;
+  lines.forEach((line) => {
+    const parts = line
+      .trim()
+      .split(",")
+      .map(Number)
+      .filter((v) => !Number.isNaN(v));
 
-    const parts = line.split(",");
-    if (parts.length === 3) {
-      const vals = parts.map((v) => parseFloat(v));
-      if (vals.every((v) => !Number.isNaN(v))) processSample(vals);
-    } else if (parts.length === 1) {
-      const v = parseFloat(parts[0]);
-      if (!Number.isNaN(v)) processSample([v, v, v]);
-    }
-  }
+    if (parts.length >= 2) processSample([parts[0], parts[1]]);
+    else if (parts.length === 1) processSample([parts[0], parts[0]]);
+  });
 }
 
 function processSample(vals) {
@@ -189,42 +125,39 @@ function processSample(vals) {
   }
   lastSampleTime = now;
 
-  const rmsWindowSamples = Math.max(
+  const rmsWindow = Math.max(
     1,
     Math.round((RMS_WINDOW_SECONDS * 1000) / estimatedDtMs)
   );
 
   vals.forEach((rawMv, i) => {
-    const ch = sensors[i];
+    const s = sensors[i];
 
-    ch.raw.push(rawMv);
-    trimToWindow(ch.raw);
+    const hp = HP_ALPHA * (s.hpState + rawMv - s.prevInput);
+    s.hpState = hp;
+    s.prevInput = rawMv;
 
-    const hp = HP_ALPHA * (ch.hpState + rawMv - ch.prevInput);
-    ch.hpState = hp;
-    ch.prevInput = rawMv;
+    const bp = s.lpState + LP_ALPHA * (hp - s.lpState);
+    s.lpState = bp;
 
-    const bandpass = ch.lpState + LP_ALPHA * (hp - ch.lpState);
-    ch.lpState = bandpass;
+    s.bandpass.push(bp);
+    trim(s.bandpass);
 
-    ch.bandpass.push(bandpass);
-    trimToWindow(ch.bandpass);
+    const rect = Math.abs(bp);
+    s.rectified.push(rect);
+    trim(s.rectified);
 
-    const rectified = Math.abs(bandpass);
-    ch.rectified.push(rectified);
-    trimToWindow(ch.rectified);
+    const r = s.rectified.slice(-rmsWindow);
+    const rms = Math.sqrt(r.reduce((a, b) => a + b * b, 0) / r.length);
+    s.smoothed.push(rms);
+    trim(s.smoothed);
 
-    const recentRect = ch.rectified.slice(-rmsWindowSamples);
-    const rms = Math.sqrt(
-      recentRect.reduce((sum, v) => sum + v * v, 0) / recentRect.length
-    );
+    const norm = (rms / mvcReferenceMv[i]) * 100;
+    s.normalized.push(norm);
+    trim(s.normalized);
 
-    ch.smoothed.push(rms);
-    trimToWindow(ch.smoothed);
-
-    const normalized = (rms / mvcReferenceMv) * 100;
-    ch.normalized.push(normalized);
-    trimToWindow(ch.normalized);
+    const maxRms = s.smoothed.length ? Math.max(...s.smoothed) : 0;
+    maxRmsEls[i].textContent = `${maxRms.toFixed(1)} mV`;
   });
 
   if (vizRunning) draw();
@@ -232,25 +165,37 @@ function processSample(vals) {
 
 function draw() {
   ctx.clearRect(0, 0, canvas.width, canvas.height);
+  drawSensorColumn(0, 0, "Sensor 1");
+  drawSensorColumn(1, canvas.width / 2, "Sensor 2");
+}
 
+function drawSensorColumn(idx, xOffset, label) {
+  const width = canvas.width / 2;
   drawSection(
-    `Raw EMG (Bandpass, mV) - ${WINDOW_SECONDS}s rolling window`,
-    sensors.map((c) => c.bandpass),
+    `${label} Raw (Bandpass, mV)`,
+    sensors[idx].bandpass,
+    xOffset,
     0,
-    220,
+    width,
+    240,
     true
   );
   drawSection(
-    "Rectified + RMS Smoothed (mV)",
-    sensors.map((c) => c.smoothed),
+    `${label} Rectified + RMS (mV)`,
+    sensors[idx].smoothed,
+    xOffset,
+    260,
+    width,
     240,
-    220
+    false
   );
   drawSection(
-    "Normalized EMG (%MVC)",
-    sensors.map((c) => c.normalized),
-    480,
-    220,
+    `${label} Normalized (%MVC)`,
+    sensors[idx].normalized,
+    xOffset,
+    520,
+    width,
+    240,
     false,
     0,
     150
@@ -259,69 +204,49 @@ function draw() {
 
 function drawSection(
   title,
-  channelData,
+  data,
+  xOffset,
   top,
+  width,
   height,
   symmetric = false,
   forcedMin = null,
   forcedMax = null
 ) {
-  const left = 70;
-  const right = canvas.width - 20;
-  const bottom = top + height - 25;
+  const left = xOffset + 55;
+  const right = xOffset + width - 15;
+  const bottom = top + height - 20;
 
   ctx.fillStyle = "#003c5a";
-  ctx.font = "16px Arial";
-  ctx.fillText(title, left, top + 18);
+  ctx.font = "14px Arial";
+  ctx.fillText(title, left, top + 16);
 
   ctx.strokeStyle = "#d0d7de";
-  ctx.strokeRect(left, top + 25, right - left, bottom - (top + 25));
+  ctx.strokeRect(left, top + 22, right - left, bottom - (top + 22));
 
-  const allVals = channelData.flat();
-  let yMin = forcedMin ?? (allVals.length ? Math.min(...allVals) : -1);
-  let yMax = forcedMax ?? (allVals.length ? Math.max(...allVals) : 1);
+  let yMin = forcedMin ?? (data.length ? Math.min(...data) : -1);
+  let yMax = forcedMax ?? (data.length ? Math.max(...data) : 1);
 
   if (symmetric) {
     const m = Math.max(Math.abs(yMin), Math.abs(yMax), 1);
     yMin = -m;
     yMax = m;
   }
-
   if (Math.abs(yMax - yMin) < 1e-6) {
     yMin -= 1;
     yMax += 1;
   }
 
-  const unit = forcedMax !== null ? "%MVC" : "mV";
-  ctx.fillStyle = "#334155";
-  ctx.font = "11px Arial";
-  ctx.fillText(`${yMax.toFixed(1)} ${unit}`, 8, top + 35);
-  ctx.fillText(`${((yMax + yMin) / 2).toFixed(1)} ${unit}`, 8, (top + bottom) / 2);
-  ctx.fillText(`${yMin.toFixed(1)} ${unit}`, 8, bottom);
-
-  const colors = ["#d62828", "#1d4ed8", "#2b9348"];
-  const points = getWindowPoints();
-  channelData.forEach((data, idx) =>
-    drawLineInBox(data, colors[idx], left, right, top + 25, bottom, yMin, yMax, points)
-  );
-}
-
-function drawLineInBox(data, color, left, right, top, bottom, yMin, yMax, points) {
-  if (!data.length) return;
-
-  const start = Math.max(0, data.length - points);
-  const visible = data.slice(start);
-
+  const visible = data.slice(-getWindowPoints());
   ctx.beginPath();
-  ctx.strokeStyle = color;
+  ctx.strokeStyle = "#1d4ed8";
   visible.forEach((v, i) => {
     const x = left + (i / Math.max(1, visible.length - 1)) * (right - left);
-    const y = bottom - ((v - yMin) / (yMax - yMin)) * (bottom - top);
+    const y = bottom - ((v - yMin) / (yMax - yMin)) * (bottom - (top + 22));
     if (i === 0) ctx.moveTo(x, y);
     else ctx.lineTo(x, y);
   });
   ctx.stroke();
 }
 
-updateMvcLabel();
 draw();

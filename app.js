@@ -3,9 +3,12 @@ const statusEl = document.getElementById("status");
 const canvas = document.getElementById("chart");
 const ctx = canvas.getContext("2d");
 
-let device;
-let notifyCharacteristic;
+let bleDevice;
+let bleNotifyCharacteristic;
+let serialPort;
+let serialReader;
 let lineBuffer = "";
+let activeTransport = null; // "ble" | "serial" | null
 
 const UART_SERVICE_UUID = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
 const UART_NOTIFY_UUID = "6e400003-b5a3-f393-e0a9-e50e24dcca9e";
@@ -20,95 +23,205 @@ function createChannel() {
 }
 
 function setStatus(message, isError = false) {
+  if (!statusEl) return;
   statusEl.textContent = message;
   statusEl.classList.toggle("error", isError);
 }
 
-connectBtn.addEventListener("click", async () => {
+function resetBuffer() {
+  lineBuffer = "";
+}
+
+function stopCurrentTransport() {
+  // BLE cleanup
+  if (bleNotifyCharacteristic) {
+    bleNotifyCharacteristic.removeEventListener("characteristicvaluechanged", handleBleData);
+    bleNotifyCharacteristic = null;
+  }
+  if (bleDevice?.gatt?.connected) {
+    bleDevice.gatt.disconnect();
+  }
+  bleDevice = null;
+
+  // Serial cleanup
+  if (serialReader) {
+    try { serialReader.cancel(); } catch (_) {}
+    serialReader = null;
+  }
+  if (serialPort) {
+    try { serialPort.close(); } catch (_) {}
+    serialPort = null;
+  }
+
+  activeTransport = null;
+  resetBuffer();
+}
+
+connectBtn?.addEventListener("click", async () => {
+  // Default button behavior: try BLE first, fall back to Serial.
   try {
-    if (!navigator.bluetooth) {
-      throw new Error("Web Bluetooth unavailable. Use Chrome/Edge on HTTPS (or localhost).");
+    await connectBluetooth();
+  } catch (bleErr) {
+    console.warn("BLE failed, trying Serial...", bleErr);
+    setStatus(`BLE failed: ${bleErr.message}. Trying Serial...`, true);
+    try {
+      await connectSerial();
+    } catch (serialErr) {
+      console.error(serialErr);
+      setStatus(`Serial failed: ${serialErr.message}`, true);
     }
-
-    setStatus("Opening Bluetooth device picker...");
-
-    // Keep a broad picker so non-NUS BLE modules can still be selected.
-    // We still prefer Nordic UART after connecting.
-    device = await navigator.bluetooth.requestDevice({
-      filters: [
-        { namePrefix: "UniSC" },
-        { services: [UART_SERVICE_UUID] }
-      ],
-      optionalServices: [UART_SERVICE_UUID, "battery_service", "device_information"]
-
-    device.addEventListener("gattserverdisconnected", onDisconnected);
-
-    setStatus(`Connecting to ${device.name || "selected device"}...`);
-    const server = await device.gatt.connect();
-
-    notifyCharacteristic = await findNotifyCharacteristic(server);
-
-    await notifyCharacteristic.startNotifications();
-    notifyCharacteristic.addEventListener("characteristicvaluechanged", handleData);
-
-    connectBtn.textContent = "Reconnect Bluetooth";
-    setStatus(`Connected to ${device.name || "device"}. Streaming notifications...`);
-  } catch (err) {
-    console.error(err);
-    setStatus(`Connection failed: ${err.message}`, true);
   }
 });
 
-async function findNotifyCharacteristic(server) {
-  // Preferred path: Nordic UART notify characteristic.
+// Expose optional functions for extra buttons in HTML.
+window.connectBluetooth = connectBluetooth;
+window.connectSerial = connectSerial;
+
+async function connectBluetooth() {
+  if (!navigator.bluetooth) {
+    throw new Error("Web Bluetooth unavailable. Use Chrome/Edge on HTTPS (or localhost).");
+  }
+
+  stopCurrentTransport();
+  setStatus("Opening Bluetooth device picker...");
+
+  // Broad picker for compatibility. You can tighten this later if needed.
+  bleDevice = await navigator.bluetooth.requestDevice({
+    acceptAllDevices: true,
+    optionalServices: [UART_SERVICE_UUID, "battery_service", "device_information"]
+  });
+
+  bleDevice.addEventListener("gattserverdisconnected", onBleDisconnected);
+
+  setStatus(`Connecting to BLE device ${bleDevice.name || "(unnamed)"}...`);
+  const server = await bleDevice.gatt.connect();
+
+  bleNotifyCharacteristic = await findBleNotifyCharacteristic(server);
+  await bleNotifyCharacteristic.startNotifications();
+  bleNotifyCharacteristic.addEventListener("characteristicvaluechanged", handleBleData);
+
+  activeTransport = "ble";
+  resetBuffer();
+  setStatus(`BLE connected to ${bleDevice.name || "device"}. Streaming...`);
+}
+
+async function findBleNotifyCharacteristic(server) {
+  // Preferred: Nordic UART notify characteristic.
   try {
     const service = await server.getPrimaryService(UART_SERVICE_UUID);
     const characteristic = await service.getCharacteristic(UART_NOTIFY_UUID);
     return characteristic;
   } catch (_) {
-    // Fallback path handled below.
+    // fallback below
   }
 
-  // Fallback: scan all services/characteristics and choose first notify-capable char.
+  // Fallback: find any notify/indicate characteristic.
   const services = await server.getPrimaryServices();
   for (const service of services) {
     const characteristics = await service.getCharacteristics();
     for (const characteristic of characteristics) {
       if (characteristic.properties.notify || characteristic.properties.indicate) {
-        setStatus(`Connected. Using notify characteristic ${characteristic.uuid}.`);
+        setStatus(`BLE connected. Using notify characteristic ${characteristic.uuid}.`);
         return characteristic;
       }
     }
   }
 
-  throw new Error("No notify/indicate characteristic found on selected device.");
+  throw new Error("No notify/indicate characteristic found on selected BLE device.");
 }
 
-function onDisconnected() {
-  setStatus("Device disconnected. Click reconnect to try again.", true);
+function onBleDisconnected() {
+  if (activeTransport === "ble") {
+    setStatus("BLE device disconnected. Reconnect to continue.", true);
+    activeTransport = null;
+  }
 }
 
-function handleData(event) {
+function handleBleData(event) {
   const decoder = new TextDecoder();
-  lineBuffer += decoder.decode(event.target.value);
+  lineBuffer += decoder.decode(event.target.value, { stream: true });
+  processBufferedLines();
+}
 
+async function connectSerial() {
+  if (!navigator.serial) {
+    throw new Error("Web Serial unavailable. Use Chrome/Edge desktop.");
+  }
+
+  stopCurrentTransport();
+  setStatus("Opening Serial port picker...");
+
+  serialPort = await navigator.serial.requestPort();
+  await serialPort.open({ baudRate: 115200 });
+
+  if (!serialPort.readable) {
+    throw new Error("Selected serial port is not readable.");
+  }
+
+  serialReader = serialPort.readable.getReader();
+  activeTransport = "serial";
+  resetBuffer();
+  setStatus("Serial connected at 115200 baud. Streaming...");
+
+  readSerialLoop().catch((err) => {
+    console.error(err);
+    if (activeTransport === "serial") {
+      setStatus(`Serial read error: ${err.message}`, true);
+      activeTransport = null;
+    }
+  });
+}
+
+async function readSerialLoop() {
+  const decoder = new TextDecoder();
+
+  while (activeTransport === "serial" && serialReader) {
+    const { value, done } = await serialReader.read();
+    if (done) break;
+    if (!value) continue;
+
+    lineBuffer += decoder.decode(value, { stream: true });
+    processBufferedLines();
+  }
+
+  // cleanup path
+  if (serialReader) {
+    try { serialReader.releaseLock(); } catch (_) {}
+    serialReader = null;
+  }
+}
+
+function processBufferedLines() {
   const lines = lineBuffer.split(/\r?\n/);
   lineBuffer = lines.pop() || "";
 
-  lines.forEach((line) => {
-    const parts = line.trim().split(",");
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+    if (!line) continue;
+
+    // Supported input formats:
+    // 1) "v1,v2,v3"
+    // 2) single value "v" (replicated to 3 channels)
+    const parts = line.split(",");
+
     if (parts.length === 3) {
       const vals = parts.map((v) => parseFloat(v));
-      if (vals.every((v) => !isNaN(v))) {
+      if (vals.every((v) => !Number.isNaN(v))) {
         processSample(vals);
       }
+    } else if (parts.length === 1) {
+      const v = parseFloat(parts[0]);
+      if (!Number.isNaN(v)) {
+        processSample([v, v, v]); // replicate single-channel input
+      }
     }
-  });
+  }
 }
 
 function processSample(vals) {
   vals.forEach((val, i) => {
     const ch = sensors[i];
+
     ch.raw.push(val);
     if (ch.raw.length > MAX_POINTS) ch.raw.shift();
 
@@ -138,6 +251,7 @@ function movingAverage(arr, window) {
 
 function draw() {
   ctx.clearRect(0, 0, canvas.width, canvas.height);
+
   const colors = ["red", "blue", "green"];
 
   sensors.forEach((ch, i) => {

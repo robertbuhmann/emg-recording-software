@@ -1,18 +1,19 @@
 const connectBtn = document.getElementById("connectBtn");
+const statusEl = document.getElementById("status");
 const canvas = document.getElementById("chart");
 const ctx = canvas.getContext("2d");
 
-let device, characteristic;
+let device;
+let characteristic;
+
+const UART_SERVICE_UUID = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
+const UART_RX_UUID = "6e400003-b5a3-f393-e0a9-e50e24dcca9e";
 
 const MAX_POINTS = 300;
 const SMOOTH_WINDOW = 10;
 
 // Data arrays for 3 sensors
-let sensors = [
-  createChannel(),
-  createChannel(),
-  createChannel()
-];
+let sensors = [createChannel(), createChannel(), createChannel()];
 
 function createChannel() {
   return {
@@ -23,20 +24,46 @@ function createChannel() {
   };
 }
 
+function setStatus(message, isError = false) {
+  statusEl.textContent = message;
+  statusEl.classList.toggle("error", isError);
+}
+
 connectBtn.addEventListener("click", async () => {
-  device = await navigator.bluetooth.requestDevice({
-    acceptAllDevices: true,
-    optionalServices: ['6e400001-b5a3-f393-e0a9-e50e24dcca9e'] // Nordic UART
-  });
+  try {
+    if (!navigator.bluetooth) {
+      throw new Error("Web Bluetooth unavailable. Use Chrome/Edge on HTTPS (or localhost).");
+    }
 
-  const server = await device.gatt.connect();
-  const service = await server.getPrimaryService('6e400001-b5a3-f393-e0a9-e50e24dcca9e');
+    setStatus("Opening Bluetooth device picker...");
 
-  characteristic = await service.getCharacteristic('6e400003-b5a3-f393-e0a9-e50e24dcca9e');
+    device = await navigator.bluetooth.requestDevice({
+      filters: [{ services: [UART_SERVICE_UUID] }],
+      optionalServices: [UART_SERVICE_UUID]
+    });
 
-  await characteristic.startNotifications();
-  characteristic.addEventListener('characteristicvaluechanged', handleData);
+    device.addEventListener("gattserverdisconnected", onDisconnected);
+
+    setStatus(`Connecting to ${device.name || "selected device"}...`);
+    const server = await device.gatt.connect();
+
+    const service = await server.getPrimaryService(UART_SERVICE_UUID);
+    characteristic = await service.getCharacteristic(UART_RX_UUID);
+
+    await characteristic.startNotifications();
+    characteristic.addEventListener("characteristicvaluechanged", handleData);
+
+    connectBtn.textContent = "Reconnect Bluetooth";
+    setStatus("Connected. Waiting for EMG packets...");
+  } catch (err) {
+    console.error(err);
+    setStatus(`Connection failed: ${err.message}`, true);
+  }
 });
+
+function onDisconnected() {
+  setStatus("Device disconnected. Click reconnect to try again.", true);
+}
 
 function handleData(event) {
   const decoder = new TextDecoder();
@@ -44,11 +71,11 @@ function handleData(event) {
 
   const lines = value.split("\n");
 
-  lines.forEach(line => {
+  lines.forEach((line) => {
     const parts = line.trim().split(",");
     if (parts.length === 3) {
-      const vals = parts.map(v => parseFloat(v));
-      if (vals.every(v => !isNaN(v))) {
+      const vals = parts.map((v) => parseFloat(v));
+      if (vals.every((v) => !isNaN(v))) {
         processSample(vals);
       }
     }
@@ -93,8 +120,8 @@ function draw() {
 
   sensors.forEach((ch, i) => {
     drawLine(ch.raw, colors[i], 0);
-    drawLine(ch.smooth, colors[i], 150); // offset so they don’t overlap
-    drawLine(ch.norm.map(v => v * 100), colors[i], 300);
+    drawLine(ch.smooth, colors[i], 150);
+    drawLine(ch.norm.map((v) => v * 100), colors[i], 300);
   });
 }
 

@@ -1,6 +1,11 @@
-const connectBtn = document.getElementById("connectBtn");
+const connectBtns = [
+  document.getElementById("connectSensor1Btn"),
+  document.getElementById("connectSensor2Btn")
+];
 const startVizBtn = document.getElementById("startVizBtn");
 const stopVizBtn = document.getElementById("stopVizBtn");
+const startTrialBtn = document.getElementById("startTrialBtn");
+const stopTrialBtn = document.getElementById("stopTrialBtn");
 const statusEl = document.getElementById("status");
 const canvas = document.getElementById("chart");
 const ctx = canvas.getContext("2d");
@@ -13,13 +18,6 @@ const maxRmsEls = [
   document.getElementById("maxRms2")
 ];
 
-let lineBuffer = "";
-let serialPort;
-let serialReader;
-let vizRunning = true;
-let estimatedDtMs = 10;
-let lastSampleTime = null;
-
 const WINDOW_SECONDS = 30;
 const RMS_WINDOW_SECONDS = 0.1;
 const MIN_POINTS = 300;
@@ -27,8 +25,18 @@ const MAX_POINTS = 4000;
 const HP_ALPHA = 0.95;
 const LP_ALPHA = 0.2;
 
+let vizRunning = true;
+let estimatedDtMs = 10;
+let lastSampleTime = null;
 let mvcReferenceMv = mvcInputs.map((i) => parseFloat(i.value) || 100);
 let sensors = [createSensor(), createSensor()];
+let ports = [null, null];
+let readers = [null, null];
+let lineBuffers = ["", ""];
+let latest = [0, 0];
+let trialActive = false;
+let trialStart = 0;
+let trialRows = [];
 
 function createSensor() {
   return {
@@ -53,114 +61,157 @@ function getWindowPoints() {
 }
 
 function trim(arr) {
-  const n = getWindowPoints();
-  while (arr.length > n) arr.shift();
+  while (arr.length > getWindowPoints()) arr.shift();
 }
 
-mvcInputs.forEach((input, idx) => {
+mvcInputs.forEach((input, idx) =>
   input.addEventListener("change", () => {
     const v = parseFloat(input.value);
     if (Number.isFinite(v) && v > 0) mvcReferenceMv[idx] = v;
-  });
-});
+  })
+);
+
+connectBtns.forEach((btn, idx) =>
+  btn.addEventListener("click", () => connectSerial(idx))
+);
 
 startVizBtn.addEventListener("click", () => {
   vizRunning = true;
-  setStatus("Visualization running.");
   draw();
+  setStatus("Visualization running.");
 });
 
 stopVizBtn.addEventListener("click", () => {
   vizRunning = false;
-  setStatus("Visualization paused. Data still streaming.");
+  setStatus("Visualization paused.");
 });
 
-connectBtn.addEventListener("click", connectSerial);
+startTrialBtn.addEventListener("click", startTrial);
+stopTrialBtn.addEventListener("click", stopTrialAndDownload);
 
-async function connectSerial() {
+async function connectSerial(sensorIdx) {
   try {
     if (!navigator.serial) throw new Error("Web Serial unavailable.");
-    serialPort = await navigator.serial.requestPort();
-    await serialPort.open({ baudRate: 115200 });
-    serialReader = serialPort.readable.getReader();
-    setStatus("Serial connected (115200). Streaming...");
-    readSerialLoop();
+    ports[sensorIdx] = await navigator.serial.requestPort();
+    await ports[sensorIdx].open({ baudRate: 115200 });
+    readers[sensorIdx] = ports[sensorIdx].readable.getReader();
+    setStatus(`Sensor ${sensorIdx + 1} connected.`);
+    readSerialLoop(sensorIdx);
   } catch (err) {
-    setStatus(`Serial failed: ${err.message}`, true);
+    setStatus(`Sensor ${sensorIdx + 1} failed: ${err.message}`, true);
   }
 }
 
-async function readSerialLoop() {
+async function readSerialLoop(sensorIdx) {
   const decoder = new TextDecoder();
-  while (serialReader) {
-    const { value, done } = await serialReader.read();
+  while (readers[sensorIdx]) {
+    const { value, done } = await readers[sensorIdx].read();
     if (done) break;
     if (!value) continue;
-    lineBuffer += decoder.decode(value, { stream: true });
-    processBufferedLines();
+    lineBuffers[sensorIdx] += decoder.decode(value, { stream: true });
+    processBufferedLines(sensorIdx);
   }
 }
 
-function processBufferedLines() {
-  const lines = lineBuffer.split(/\r?\n/);
-  lineBuffer = lines.pop() || "";
+function processBufferedLines(sensorIdx) {
+  const lines = lineBuffers[sensorIdx].split(/\r?\n/);
+  lineBuffers[sensorIdx] = lines.pop() || "";
 
   lines.forEach((line) => {
-    const parts = line
+    const nums = line
       .trim()
       .split(",")
       .map(Number)
       .filter((v) => !Number.isNaN(v));
-
-    if (parts.length >= 2) processSample([parts[0], parts[1]]);
-    else if (parts.length === 1) processSample([parts[0], parts[0]]);
+    if (nums.length) processSample(sensorIdx, nums[0]);
   });
 }
 
-function processSample(vals) {
+function processSample(sensorIdx, rawMv) {
   const now = performance.now();
   if (lastSampleTime !== null) {
     const dt = now - lastSampleTime;
     if (dt > 0 && dt < 200) estimatedDtMs = 0.95 * estimatedDtMs + 0.05 * dt;
   }
   lastSampleTime = now;
+  latest[sensorIdx] = rawMv;
+
+  const s = sensors[sensorIdx];
+  const hp = HP_ALPHA * (s.hpState + rawMv - s.prevInput);
+  s.hpState = hp;
+  s.prevInput = rawMv;
+
+  const bp = s.lpState + LP_ALPHA * (hp - s.lpState);
+  s.lpState = bp;
+  s.bandpass.push(bp);
+  trim(s.bandpass);
+
+  const rect = Math.abs(bp);
+  s.rectified.push(rect);
+  trim(s.rectified);
 
   const rmsWindow = Math.max(
     1,
     Math.round((RMS_WINDOW_SECONDS * 1000) / estimatedDtMs)
   );
+  const recent = s.rectified.slice(-rmsWindow);
+  const rms = Math.sqrt(recent.reduce((a, b) => a + b * b, 0) / recent.length);
+  s.smoothed.push(rms);
+  trim(s.smoothed);
 
-  vals.forEach((rawMv, i) => {
-    const s = sensors[i];
+  const norm = (rms / mvcReferenceMv[sensorIdx]) * 100;
+  s.normalized.push(norm);
+  trim(s.normalized);
 
-    const hp = HP_ALPHA * (s.hpState + rawMv - s.prevInput);
-    s.hpState = hp;
-    s.prevInput = rawMv;
+  maxRmsEls[sensorIdx].textContent = `${Math.max(...s.smoothed, 0).toFixed(1)} mV`;
 
-    const bp = s.lpState + LP_ALPHA * (hp - s.lpState);
-    s.lpState = bp;
-
-    s.bandpass.push(bp);
-    trim(s.bandpass);
-
-    const rect = Math.abs(bp);
-    s.rectified.push(rect);
-    trim(s.rectified);
-
-    const r = s.rectified.slice(-rmsWindow);
-    const rms = Math.sqrt(r.reduce((a, b) => a + b * b, 0) / r.length);
-    s.smoothed.push(rms);
-    trim(s.smoothed);
-
-    const norm = (rms / mvcReferenceMv[i]) * 100;
-    s.normalized.push(norm);
-    trim(s.normalized);
-
-    const maxRms = s.smoothed.length ? Math.max(...s.smoothed) : 0;
-    maxRmsEls[i].textContent = `${maxRms.toFixed(1)} mV`;
-  });
+  if (trialActive) {
+    const t = Math.round(performance.now() - trialStart);
+    trialRows.push([
+      t,
+      latest[0],
+      sensors[0].smoothed.at(-1) || 0,
+      sensors[0].normalized.at(-1) || 0,
+      latest[1],
+      sensors[1].smoothed.at(-1) || 0,
+      sensors[1].normalized.at(-1) || 0
+    ]);
+  }
 
   if (vizRunning) draw();
+}
+
+function startTrial() {
+  trialActive = true;
+  trialStart = performance.now();
+  trialRows = [];
+  stopTrialBtn.disabled = false;
+  setStatus("Trial recording started.");
+}
+
+function stopTrialAndDownload() {
+  trialActive = false;
+  stopTrialBtn.disabled = true;
+
+  const header = [
+    "time_ms",
+    "s1_raw_mV",
+    "s1_rms_mV",
+    "s1_norm_pctMVC",
+    "s2_raw_mV",
+    "s2_rms_mV",
+    "s2_norm_pctMVC"
+  ];
+
+  const csv = [header, ...trialRows].map((r) => r.join(",")).join("\n");
+  const blob = new Blob([csv], { type: "text/csv" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = `emg_trial_${new Date().toISOString().replace(/[:.]/g, "-")}.csv`;
+  a.click();
+  URL.revokeObjectURL(a.href);
+
+  setStatus("Trial stopped and CSV downloaded.");
 }
 
 function draw() {
@@ -178,7 +229,10 @@ function drawSensorColumn(idx, xOffset, label) {
     0,
     width,
     240,
-    true
+    true,
+    null,
+    null,
+    "mV"
   );
   drawSection(
     `${label} Rectified + RMS (mV)`,
@@ -187,7 +241,10 @@ function drawSensorColumn(idx, xOffset, label) {
     260,
     width,
     240,
-    false
+    false,
+    null,
+    null,
+    "mV"
   );
   drawSection(
     `${label} Normalized (%MVC)`,
@@ -198,7 +255,8 @@ function drawSensorColumn(idx, xOffset, label) {
     240,
     false,
     0,
-    150
+    150,
+    "%MVC"
   );
 }
 
@@ -209,9 +267,10 @@ function drawSection(
   top,
   width,
   height,
-  symmetric = false,
-  forcedMin = null,
-  forcedMax = null
+  symmetric,
+  forcedMin,
+  forcedMax,
+  unit
 ) {
   const left = xOffset + 55;
   const right = xOffset + width - 15;
@@ -236,6 +295,12 @@ function drawSection(
     yMin -= 1;
     yMax += 1;
   }
+
+  ctx.fillStyle = "#334155";
+  ctx.font = "11px Arial";
+  ctx.fillText(`${yMax.toFixed(1)} ${unit}`, xOffset + 4, top + 35);
+  ctx.fillText(`${((yMax + yMin) / 2).toFixed(1)} ${unit}`, xOffset + 4, (top + bottom) / 2);
+  ctx.fillText(`${yMin.toFixed(1)} ${unit}`, xOffset + 4, bottom);
 
   const visible = data.slice(-getWindowPoints());
   ctx.beginPath();

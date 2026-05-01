@@ -4,24 +4,19 @@ const canvas = document.getElementById("chart");
 const ctx = canvas.getContext("2d");
 
 let device;
-let characteristic;
+let notifyCharacteristic;
+let lineBuffer = "";
 
 const UART_SERVICE_UUID = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
-const UART_RX_UUID = "6e400003-b5a3-f393-e0a9-e50e24dcca9e";
+const UART_NOTIFY_UUID = "6e400003-b5a3-f393-e0a9-e50e24dcca9e";
 
 const MAX_POINTS = 300;
 const SMOOTH_WINDOW = 10;
 
-// Data arrays for 3 sensors
 let sensors = [createChannel(), createChannel(), createChannel()];
 
 function createChannel() {
-  return {
-    raw: [],
-    rect: [],
-    smooth: [],
-    norm: []
-  };
+  return { raw: [], rect: [], smooth: [], norm: [] };
 }
 
 function setStatus(message, isError = false) {
@@ -37,9 +32,11 @@ connectBtn.addEventListener("click", async () => {
 
     setStatus("Opening Bluetooth device picker...");
 
+    // Keep a broad picker so non-NUS BLE modules can still be selected.
+    // We still prefer Nordic UART after connecting.
     device = await navigator.bluetooth.requestDevice({
-      filters: [{ services: [UART_SERVICE_UUID] }],
-      optionalServices: [UART_SERVICE_UUID]
+      acceptAllDevices: true,
+      optionalServices: [UART_SERVICE_UUID, "battery_service", "device_information"]
     });
 
     device.addEventListener("gattserverdisconnected", onDisconnected);
@@ -47,19 +44,43 @@ connectBtn.addEventListener("click", async () => {
     setStatus(`Connecting to ${device.name || "selected device"}...`);
     const server = await device.gatt.connect();
 
-    const service = await server.getPrimaryService(UART_SERVICE_UUID);
-    characteristic = await service.getCharacteristic(UART_RX_UUID);
+    notifyCharacteristic = await findNotifyCharacteristic(server);
 
-    await characteristic.startNotifications();
-    characteristic.addEventListener("characteristicvaluechanged", handleData);
+    await notifyCharacteristic.startNotifications();
+    notifyCharacteristic.addEventListener("characteristicvaluechanged", handleData);
 
     connectBtn.textContent = "Reconnect Bluetooth";
-    setStatus("Connected. Waiting for EMG packets...");
+    setStatus(`Connected to ${device.name || "device"}. Streaming notifications...`);
   } catch (err) {
     console.error(err);
     setStatus(`Connection failed: ${err.message}`, true);
   }
 });
+
+async function findNotifyCharacteristic(server) {
+  // Preferred path: Nordic UART notify characteristic.
+  try {
+    const service = await server.getPrimaryService(UART_SERVICE_UUID);
+    const characteristic = await service.getCharacteristic(UART_NOTIFY_UUID);
+    return characteristic;
+  } catch (_) {
+    // Fallback path handled below.
+  }
+
+  // Fallback: scan all services/characteristics and choose first notify-capable char.
+  const services = await server.getPrimaryServices();
+  for (const service of services) {
+    const characteristics = await service.getCharacteristics();
+    for (const characteristic of characteristics) {
+      if (characteristic.properties.notify || characteristic.properties.indicate) {
+        setStatus(`Connected. Using notify characteristic ${characteristic.uuid}.`);
+        return characteristic;
+      }
+    }
+  }
+
+  throw new Error("No notify/indicate characteristic found on selected device.");
+}
 
 function onDisconnected() {
   setStatus("Device disconnected. Click reconnect to try again.", true);
@@ -67,9 +88,10 @@ function onDisconnected() {
 
 function handleData(event) {
   const decoder = new TextDecoder();
-  const value = decoder.decode(event.target.value);
+  lineBuffer += decoder.decode(event.target.value);
 
-  const lines = value.split("\n");
+  const lines = lineBuffer.split(/\r?\n/);
+  lineBuffer = lines.pop() || "";
 
   lines.forEach((line) => {
     const parts = line.trim().split(",");
@@ -85,7 +107,6 @@ function handleData(event) {
 function processSample(vals) {
   vals.forEach((val, i) => {
     const ch = sensors[i];
-
     ch.raw.push(val);
     if (ch.raw.length > MAX_POINTS) ch.raw.shift();
 
@@ -115,7 +136,6 @@ function movingAverage(arr, window) {
 
 function draw() {
   ctx.clearRect(0, 0, canvas.width, canvas.height);
-
   const colors = ["red", "blue", "green"];
 
   sensors.forEach((ch, i) => {

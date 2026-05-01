@@ -1,4 +1,12 @@
-@@ -10,35 +10,44 @@ header {
+body {
+  margin: 0;
+  font-family: Arial, sans-serif;
+  background: #f4f7f9;
+  color: #003c5a;
+}
+
+header {
+  background: #005f73;
   color: white;
   padding: 1rem;
   display: flex;

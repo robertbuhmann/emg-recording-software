@@ -1,8 +1,8 @@
 body { margin: 0; font-family: Arial, sans-serif; background: #f4f7f9; color: #003c5a; }
-header { background: #005f73; color: white; padding: 1rem; display: flex; justify-content: space-between; align-items: center; }
-button { background: #0a9396; border: none; padding: 0.5rem 1rem; color: white; cursor: pointer; border-radius: 4px; }
+header { background: #005f73; color: white; padding: 1rem; display: flex; justify-content: space-between; align-items: center; gap: 1rem; }
+button { background: #0a9396; border: none; padding: 0.45rem 0.8rem; color: white; cursor: pointer; border-radius: 4px; }
 button:hover { background: #94d2bd; color: #003c5a; }
-.top-actions { display: flex; gap: 0.5rem; }
+.top-actions { display: flex; gap: 0.5rem; flex-wrap: wrap; justify-content: flex-end; }
 main { padding: 1rem; }
 .status { margin: 0 0 0.75rem; font-weight: 600; }
 .status.error { color: #b00020; }
@@ -11,5 +11,5 @@ main { padding: 1rem; }
 .sensor-card h3 { margin: 0 0 0.35rem; }
 .sensor-card input { width: 100px; margin-left: 0.5rem; }
 .metric { margin-top: 0.4rem; font-weight: 600; }
-canvas { border: 1px solid #ccc; background: white; }
+canvas { border: 1px solid #ccc; background: white; max-width: 100%; height: auto; }
 footer { text-align: center; padding: 1rem; font-size: 0.9rem; }

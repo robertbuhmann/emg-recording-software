@@ -7,7 +7,7 @@
 </head>
 <body>
   <header>
-    <h1>UniSC EMG Monitor (3-Channel)</h1>
+    <h1>UniSC EMG Monitor (2 Sensors)</h1>
     <div class="top-actions">
       <button id="connectBtn">Connect Bluetooth</button>
       <button id="startVizBtn">Start</button>
@@ -17,13 +17,21 @@
 
   <main>
     <p id="status" class="status">Not connected.</p>
-    <section class="controls">
-      <label for="mvcInput">MVC reference (mV):</label>
-      <input id="mvcInput" type="number" min="0.1" step="0.1" value="100" />
-      <button id="applyMvcBtn">Apply MVC</button>
-      <span id="mvcLabel">Current MVC: 100.0 mV</span>
+    <section class="sensor-controls">
+      <div class="sensor-card">
+        <h3>Sensor 1</h3>
+        <label for="mvcInput1">MVC (mV)</label>
+        <input id="mvcInput1" type="number" min="0.1" step="0.1" value="100" />
+        <div class="metric">Window max RMS: <span id="maxRms1">0.0 mV</span></div>
+      </div>
+      <div class="sensor-card">
+        <h3>Sensor 2</h3>
+        <label for="mvcInput2">MVC (mV)</label>
+        <input id="mvcInput2" type="number" min="0.1" step="0.1" value="100" />
+        <div class="metric">Window max RMS: <span id="maxRms2">0.0 mV</span></div>
+      </div>
     </section>
-    <canvas id="chart" width="1200" height="720"></canvas>
+    <canvas id="chart" width="1400" height="780"></canvas>
   </main>
 
   <footer>

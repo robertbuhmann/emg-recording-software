@@ -35,9 +35,11 @@ connectBtn.addEventListener("click", async () => {
     // Keep a broad picker so non-NUS BLE modules can still be selected.
     // We still prefer Nordic UART after connecting.
     device = await navigator.bluetooth.requestDevice({
-      filters: [{ namePrefix: "UniSC_EMG3" }],
+      filters: [
+        { namePrefix: "UniSC" },
+        { services: [UART_SERVICE_UUID] }
+      ],
       optionalServices: [UART_SERVICE_UUID, "battery_service", "device_information"]
-    });
 
     device.addEventListener("gattserverdisconnected", onDisconnected);
 

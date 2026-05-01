@@ -9,14 +9,8 @@ const stopTrialBtn = document.getElementById("stopTrialBtn");
 const statusEl = document.getElementById("status");
 const canvas = document.getElementById("chart");
 const ctx = canvas.getContext("2d");
-const mvcInputs = [
-  document.getElementById("mvcInput1"),
-  document.getElementById("mvcInput2")
-];
-const maxRmsEls = [
-  document.getElementById("maxRms1"),
-  document.getElementById("maxRms2")
-];
+const mvcInputs = [document.getElementById("mvcInput1"), document.getElementById("mvcInput2")];
+const maxRmsEls = [document.getElementById("maxRms1"), document.getElementById("maxRms2")];
 
 const WINDOW_SECONDS = 30;
 const RMS_WINDOW_SECONDS = 0.1;
@@ -24,6 +18,7 @@ const MIN_POINTS = 300;
 const MAX_POINTS = 4000;
 const HP_ALPHA = 0.95;
 const LP_ALPHA = 0.2;
+const MAX_FPS = 25;
 
 let vizRunning = true;
 let estimatedDtMs = 10;
@@ -37,6 +32,8 @@ let latest = [0, 0];
 let trialActive = false;
 let trialStart = 0;
 let trialRows = [];
+let needsRedraw = false;
+let lastDrawTs = 0;
 
 function createSensor() {
   return {
@@ -46,7 +43,8 @@ function createSensor() {
     normalized: [],
     hpState: 0,
     prevInput: 0,
-    lpState: 0
+    lpState: 0,
+    lastMaxUpdate: 0
   };
 }
 
@@ -61,8 +59,23 @@ function getWindowPoints() {
 }
 
 function trim(arr) {
-  while (arr.length > getWindowPoints()) arr.shift();
+  const n = getWindowPoints();
+  if (arr.length > n) arr.splice(0, arr.length - n);
 }
+
+function scheduleDraw() {
+  needsRedraw = true;
+}
+
+function drawLoop(ts) {
+  if (vizRunning && needsRedraw && ts - lastDrawTs > 1000 / MAX_FPS) {
+    draw();
+    needsRedraw = false;
+    lastDrawTs = ts;
+  }
+  requestAnimationFrame(drawLoop);
+}
+requestAnimationFrame(drawLoop);
 
 mvcInputs.forEach((input, idx) =>
   input.addEventListener("change", () => {
@@ -77,7 +90,7 @@ connectBtns.forEach((btn, idx) =>
 
 startVizBtn.addEventListener("click", () => {
   vizRunning = true;
-  draw();
+  scheduleDraw();
   setStatus("Visualization running.");
 });
 
@@ -92,9 +105,12 @@ stopTrialBtn.addEventListener("click", stopTrialAndDownload);
 async function connectSerial(sensorIdx) {
   try {
     if (!navigator.serial) throw new Error("Web Serial unavailable.");
+    if (readers[sensorIdx]) throw new Error("Already connected.");
+
     ports[sensorIdx] = await navigator.serial.requestPort();
     await ports[sensorIdx].open({ baudRate: 115200 });
     readers[sensorIdx] = ports[sensorIdx].readable.getReader();
+
     setStatus(`Sensor ${sensorIdx + 1} connected.`);
     readSerialLoop(sensorIdx);
   } catch (err) {
@@ -104,10 +120,12 @@ async function connectSerial(sensorIdx) {
 
 async function readSerialLoop(sensorIdx) {
   const decoder = new TextDecoder();
+
   while (readers[sensorIdx]) {
     const { value, done } = await readers[sensorIdx].read();
     if (done) break;
     if (!value) continue;
+
     lineBuffers[sensorIdx] += decoder.decode(value, { stream: true });
     processBufferedLines(sensorIdx);
   }
@@ -117,14 +135,10 @@ function processBufferedLines(sensorIdx) {
   const lines = lineBuffers[sensorIdx].split(/\r?\n/);
   lineBuffers[sensorIdx] = lines.pop() || "";
 
-  lines.forEach((line) => {
-    const nums = line
-      .trim()
-      .split(",")
-      .map(Number)
-      .filter((v) => !Number.isNaN(v));
-    if (nums.length) processSample(sensorIdx, nums[0]);
-  });
+  for (const line of lines) {
+    const nums = line.trim().split(",").map(Number);
+    if (nums.length && Number.isFinite(nums[0])) processSample(sensorIdx, nums[0]);
+  }
 }
 
 function processSample(sensorIdx, rawMv) {
@@ -137,6 +151,7 @@ function processSample(sensorIdx, rawMv) {
   latest[sensorIdx] = rawMv;
 
   const s = sensors[sensorIdx];
+
   const hp = HP_ALPHA * (s.hpState + rawMv - s.prevInput);
   s.hpState = hp;
   s.prevInput = rawMv;
@@ -150,10 +165,7 @@ function processSample(sensorIdx, rawMv) {
   s.rectified.push(rect);
   trim(s.rectified);
 
-  const rmsWindow = Math.max(
-    1,
-    Math.round((RMS_WINDOW_SECONDS * 1000) / estimatedDtMs)
-  );
+  const rmsWindow = Math.max(1, Math.round((RMS_WINDOW_SECONDS * 1000) / estimatedDtMs));
   const recent = s.rectified.slice(-rmsWindow);
   const rms = Math.sqrt(recent.reduce((a, b) => a + b * b, 0) / recent.length);
   s.smoothed.push(rms);
@@ -163,10 +175,18 @@ function processSample(sensorIdx, rawMv) {
   s.normalized.push(norm);
   trim(s.normalized);
 
-  maxRmsEls[sensorIdx].textContent = `${Math.max(...s.smoothed, 0).toFixed(1)} mV`;
+  // Update displayed max RMS at lower rate to reduce UI overhead
+  if (now - s.lastMaxUpdate > 250) {
+    s.lastMaxUpdate = now;
+    let max = 0;
+    for (let i = 0; i < s.smoothed.length; i++) {
+      if (s.smoothed[i] > max) max = s.smoothed[i];
+    }
+    maxRmsEls[sensorIdx].textContent = `${max.toFixed(1)} mV`;
+  }
 
   if (trialActive) {
-    const t = Math.round(performance.now() - trialStart);
+    const t = Math.round(now - trialStart);
     trialRows.push([
       t,
       latest[0],
@@ -178,7 +198,7 @@ function processSample(sensorIdx, rawMv) {
     ]);
   }
 
-  if (vizRunning) draw();
+  scheduleDraw();
 }
 
 function startTrial() {
@@ -205,6 +225,7 @@ function stopTrialAndDownload() {
 
   const csv = [header, ...trialRows].map((r) => r.join(",")).join("\n");
   const blob = new Blob([csv], { type: "text/csv" });
+
   const a = document.createElement("a");
   a.href = URL.createObjectURL(blob);
   a.download = `emg_trial_${new Date().toISOString().replace(/[:.]/g, "-")}.csv`;
@@ -305,13 +326,15 @@ function drawSection(
   const visible = data.slice(-getWindowPoints());
   ctx.beginPath();
   ctx.strokeStyle = "#1d4ed8";
-  visible.forEach((v, i) => {
+
+  for (let i = 0; i < visible.length; i++) {
+    const v = visible[i];
     const x = left + (i / Math.max(1, visible.length - 1)) * (right - left);
     const y = bottom - ((v - yMin) / (yMax - yMin)) * (bottom - (top + 22));
     if (i === 0) ctx.moveTo(x, y);
     else ctx.lineTo(x, y);
-  });
+  }
   ctx.stroke();
 }
 
-draw();
+scheduleDraw();

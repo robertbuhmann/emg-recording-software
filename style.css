@@ -23,6 +23,11 @@ button {
   border-radius: 4px;
 }
 
+.top-actions {
+  display: flex;
+  gap: 0.5rem;
+}
+
 button:hover {
   background: #94d2bd;
   color: #003c5a;
@@ -30,6 +35,23 @@ button:hover {
 
 main {
   padding: 1rem;
+}
+
+.controls {
+  display: flex;
+  gap: 0.6rem;
+  align-items: center;
+  flex-wrap: wrap;
+  margin-bottom: 0.75rem;
+}
+
+.controls input {
+  width: 120px;
+  padding: 0.3rem;
+}
+
+#mvcLabel {
+  font-weight: 600;
 }
 
 .status {
